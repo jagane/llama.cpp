@@ -357,6 +357,7 @@ struct cmd_params {
     std::vector<llama_lazy_mode>     lazy_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
+    std::vector<bool>                kv_offload_swa_only;
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
@@ -403,6 +404,7 @@ static const cmd_params cmd_params_defaults = {
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
+    /* kv_offload_swa_only  */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
@@ -475,6 +477,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
+    printf("  -kvos, --kv-offload-swa-only <0|1>                (default: %s)\n", join(cmd_params_defaults.kv_offload_swa_only, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
@@ -846,6 +849,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_kv_offload.insert(params.no_kv_offload.end(), p.begin(), p.end());
+            } else if (arg == "-kvos" || arg == "--kv-offload-swa-only") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.kv_offload_swa_only.insert(params.kv_offload_swa_only.end(), p.begin(), p.end());
             } else if (arg == "--numa") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1159,6 +1169,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
+    if (params.kv_offload_swa_only.empty()) {
+        params.kv_offload_swa_only = cmd_params_defaults.kv_offload_swa_only;
+    }
     if (params.no_kv_offload.empty()) {
         params.no_kv_offload = cmd_params_defaults.no_kv_offload;
     }
@@ -1228,6 +1241,7 @@ struct cmd_params_instance {
     llama_lazy_mode    lazy_mode;
     int                main_gpu;
     bool               no_kv_offload;
+    bool               kv_offload_swa_only;
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
@@ -1311,6 +1325,7 @@ struct cmd_params_instance {
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
+        cparams.kv_offload_swa_only = kv_offload_swa_only;
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
@@ -1346,6 +1361,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
+    for (const auto & kvos : params.kv_offload_swa_only)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
@@ -1376,6 +1392,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_offload_swa_only   = */ kvos,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1414,6 +1431,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_offload_swa_only   = */ kvos,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1452,6 +1470,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_offload_swa_only   = */ kvos,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1495,6 +1514,7 @@ struct test {
     llama_lazy_mode          lazy_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
+    bool                     kv_offload_swa_only;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
@@ -1536,6 +1556,7 @@ struct test {
         lazy_mode      = inst.lazy_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
+        kv_offload_swa_only = inst.kv_offload_swa_only;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
@@ -1601,7 +1622,7 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "kv_offload_swa_only",             "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
@@ -1621,7 +1642,7 @@ struct test {
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
-        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
+        if (field == "f16_kv" || field == "no_kv_offload" || field == "kv_offload_swa_only" || field == "cpu_strict" ||
             field == "embeddings" || field == "no_host" || field == "repack") {
             return BOOL;
         }
@@ -1693,6 +1714,7 @@ struct test {
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
+                                            std::to_string(kv_offload_swa_only),
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,
@@ -1921,6 +1943,9 @@ struct markdown_printer : public printer {
         if (field == "no_kv_offload") {
             return "nkvo";
         }
+        if (field == "kv_offload_swa_only") {
+            return "kvos";
+        }
         if (field == "flash_attn") {
             return "fa";
         }
@@ -2004,6 +2029,9 @@ struct markdown_printer : public printer {
         }
         if (params.no_kv_offload.size() > 1 || params.no_kv_offload != cmd_params_defaults.no_kv_offload) {
             fields.emplace_back("no_kv_offload");
+        }
+        if (params.kv_offload_swa_only.size() > 1 || params.kv_offload_swa_only != cmd_params_defaults.kv_offload_swa_only) {
+            fields.emplace_back("kv_offload_swa_only");
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");

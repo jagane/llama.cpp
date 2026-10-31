@@ -336,6 +336,12 @@ llama_context_ptr make_ctx(llama_model * model, const common_params & params, co
     if (opts.kv_unified >= 0) {
         cparams.kv_unified = opts.kv_unified != 0;
     }
+    if (opts.kv_offload >= 0) {
+        cparams.offload_kqv = opts.kv_offload != 0;
+    }
+    if (opts.kv_offload_swa_only) {
+        cparams.kv_offload_swa_only = true;
+    }
     if (opts.n_rs_seq) {
         cparams.n_rs_seq = opts.n_rs_seq;
         cparams.n_batch  = std::max(cparams.n_batch,  (uint32_t) (opts.n_rs_seq + 1));

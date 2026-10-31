@@ -879,6 +879,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.mmproj_use_gpu = params.mmproj_device != nullptr;
     }
 
+    if (params.kv_offload_swa_only && params.no_kv_offload) {
+        throw std::invalid_argument("error: --kv-offload-swa-only cannot be used with --no-kv-offload\n");
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -2369,6 +2373,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_kv_offload = !value;
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
+    add_opt(common_arg(
+        {"--kv-offload-swa-only"},
+        "offload only the KV cache of the SWA layers, keep the KV cache of the non-SWA layers in host memory (default: disabled)",
+        [](common_params & params) {
+            params.kv_offload_swa_only = true;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_SWA_ONLY"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},

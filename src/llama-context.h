@@ -395,6 +395,9 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // a second backend of each GPU device, used to copy the KV of the host layers to the device during the compute
+    std::vector<ggml_backend_ptr> backends_copy;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 

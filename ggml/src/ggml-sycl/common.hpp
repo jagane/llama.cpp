@@ -16,10 +16,12 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include "base.hpp"
 #include "dpct/helper.hpp"
@@ -478,6 +480,28 @@ struct ggml_backend_sycl_context {
     optimize_feature opt_feature;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
+
+    // a dedicated queue instead of the default queue of the device, used only for copies
+    // with Level Zero, a barrier on this queue serializes it with the other queues, so the events are passed to the copies instead:
+    // the events to wait for are given to the next copy, and the event of the last copy is recorded
+    std::unique_ptr<sycl::queue> own_queue;
+    std::vector<sycl::event>     own_queue_deps;
+    std::optional<sycl::event>   own_queue_last;
+
+    // [GGML_SYCL_COPY_TRACE=<file>] the copies of the copy queue are profiled, their submit/start/end times are written to the file
+    struct copy_trace_entry {
+        sycl::event  ev;
+        uint64_t     host_ns;
+        size_t       size;
+        const void * dst;
+    };
+    std::vector<copy_trace_entry> copy_trace;
+    FILE *                        copy_trace_file = nullptr;
+
+    // [GGML_SYCL_COPY_TRACE] a compute backend uses a profiled queue, the times of its event waits and records are written
+    std::unique_ptr<sycl::queue>                     trace_queue;
+    std::vector<std::pair<char, sycl::event>>        compute_trace;
+    FILE *                                           compute_trace_file = nullptr;
 
     explicit ggml_backend_sycl_context(int device) :
         device(device),

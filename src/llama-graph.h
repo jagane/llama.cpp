@@ -1078,6 +1078,9 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // the last attention that read each KV staging buffer, the next copy to the buffer waits for it
+    mutable std::map<const ggml_tensor *, ggml_tensor *> kv_stage_last;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

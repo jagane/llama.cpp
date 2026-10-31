@@ -18,6 +18,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 ggml_type   type_v,
                      bool   v_trans,
                      bool   offload,
+                     bool   offload_swa_only,
                      bool   swa_full,
                      bool   unified,
                  uint32_t   kv_size,
@@ -27,7 +28,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share) :
-    llama_kv_cache_iswa(model, no_alloc, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
+    llama_kv_cache_iswa(model, no_alloc, model.hparams, type_k, type_v, v_trans, offload, offload_swa_only, swa_full, unified,
             kv_size, n_seq_max, n_ubatch, mem_other, filter, reuse, share) {
 }
 
@@ -39,6 +40,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 ggml_type   type_v,
                      bool   v_trans,
                      bool   offload,
+                     bool   offload_swa_only,
                      bool   swa_full,
                      bool   unified,
                  uint32_t   kv_size,
@@ -80,7 +82,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
 
-    LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
+    const bool offload_base = offload && !offload_swa_only;
+
+    LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells%s\n", __func__, size_base,
+            offload == offload_base ? "" : ", in host memory");
 
     llama_memory_t mem_other_base = nullptr;
     if (mem_other) {
@@ -94,8 +99,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k, type_v,
-            v_trans, offload, unified, size_base, n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            v_trans, offload_base, unified, size_base, n_seq_max,
+            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, "", offload && !offload_base);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 

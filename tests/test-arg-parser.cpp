@@ -313,6 +313,38 @@ static void test(void) {
     assert(params.lora_adapters[2].path == "file3\"3\".gguf");
     assert(params.lora_adapters[3].path == "file4\".gguf");
 
+    {
+        common_params kv_params;
+        argv = {"binary_name", "-m", "model_file.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        assert(kv_params.kv_offload_swa_only == false);
+        assert(common_context_params_to_llama(kv_params).kv_offload_swa_only == false);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-offload-swa-only"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        assert(kv_params.kv_offload_swa_only == true);
+        assert(kv_params.no_kv_offload == false);
+        assert(common_context_params_to_llama(kv_params).kv_offload_swa_only == true);
+        assert(common_context_params_to_llama(kv_params).offload_kqv == true);
+    }
+
+    {
+        common_params kv_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-offload-swa-only", "--kv-offload"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+        assert(kv_params.kv_offload_swa_only == true);
+    }
+
+    // --kv-offload-swa-only needs KV offload, in any order
+    for (const auto & args : std::vector<std::vector<std::string>>{
+            {"binary_name", "-m", "model_file.gguf", "--kv-offload-swa-only", "-nkvo"},
+            {"binary_name", "-m", "model_file.gguf", "--no-kv-offload", "--kv-offload-swa-only"},
+        }) {
+        common_params kv_params;
+        argv = args;
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+    }
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");
@@ -371,6 +403,34 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "overwritten.gguf");
     assert(params.cpuparams.n_threads == 1010);
+
+    printf("test-arg-parser: test --kv-offload-swa-only environment variables\n\n");
+
+    {
+        common_params kv_params;
+        setenv("LLAMA_ARG_KV_OFFLOAD_SWA_ONLY", "1", true);
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        assert(kv_params.kv_offload_swa_only == true);
+    }
+
+    {
+        common_params kv_params;
+        setenv("LLAMA_ARG_KV_OFFLOAD_SWA_ONLY", "1", true);
+        setenv("LLAMA_ARG_KV_OFFLOAD", "0", true);
+        argv = {"binary_name"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params kv_params;
+        setenv("LLAMA_ARG_KV_OFFLOAD_SWA_ONLY", "1", true);
+        argv = {"binary_name", "-nkvo"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    unsetenv("LLAMA_ARG_KV_OFFLOAD_SWA_ONLY");
+    unsetenv("LLAMA_ARG_KV_OFFLOAD");
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");
