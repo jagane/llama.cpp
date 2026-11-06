@@ -6,7 +6,9 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -406,6 +408,17 @@ llama_context::llama_context(
         }
     }
 
+    cparams.kv_offload_swa_only = params.kv_offload_swa_only;
+    if (cparams.kv_offload_swa_only && !cparams.offload_kqv) {
+        LLAMA_LOG_WARN("%s: kv_offload_swa_only has no effect without offload_kqv, ignoring\n", __func__);
+        cparams.kv_offload_swa_only = false;
+    }
+    if (cparams.kv_offload_swa_only && cparams.auto_fkvr) {
+        // kv_rows gathers the KV by cell index, it is not wired to the staging buffers of the host layers
+        LLAMA_LOG_INFO("%s: kv_offload_swa_only set, disabling kv_rows\n", __func__);
+        cparams.auto_fkvr = false;
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -547,6 +560,12 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
+    // the graph also reads this flag, so reset it when the memory does not use it
+    if (cparams.kv_offload_swa_only && !dynamic_cast<llama_kv_cache_iswa *>(memory.get()) && !dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+        LLAMA_LOG_WARN("%s: kv_offload_swa_only is not supported by the memory of this model, ignoring\n", __func__);
+        cparams.kv_offload_swa_only = false;
+    }
+
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
@@ -582,6 +601,7 @@ llama_context::llama_context(
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
+            !cparams.kv_offload_swa_only &&
             !model.has_tensor_overrides() &&
             cparams.moe_cache_size == 0; // not supported by the MoE cache
 
@@ -638,6 +658,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // the copies of the KV cache started for the next graph, before the copy backends are freed
+    if (sched) {
+        ggml_backend_sched_drop_prefetch_next(sched.get());
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -786,6 +811,41 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    if (cparams.kv_offload_swa_only) {
+        if (backends_copy.empty()) {
+            for (const auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    continue;
+                }
+
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                if (!props.caps.async || !props.caps.events) {
+                    LLAMA_LOG_INFO("%s: %s: no copy queue, device does not support async (%d) and events (%d)\n", __func__,
+                            ggml_backend_dev_name(dev), props.caps.async, props.caps.events);
+                    continue;
+                }
+
+                ggml_backend_t backend_copy = ggml_backend_dev_init(dev, "copy_queue");
+                if (backend_copy != nullptr) {
+                    LLAMA_LOG_INFO("%s: %s: created copy queue backend for the KV of the host layers\n", __func__, ggml_backend_dev_name(dev));
+                    backends_copy.emplace_back(backend_copy);
+                } else {
+                    LLAMA_LOG_WARN("%s: %s: failed to create copy queue backend\n", __func__, ggml_backend_dev_name(dev));
+                }
+            }
+        }
+
+        for (const auto & backend_copy : backends_copy) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == ggml_backend_get_device(backend_copy.get())) {
+                    ggml_backend_sched_set_copy_backend(sched.get(), backend.get(), backend_copy.get());
+                }
+            }
+        }
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -1046,6 +1106,9 @@ bool llama_context::memory_update(bool optimize) {
                     return false;
                 }
         }
+
+        // the update can modify the KV cache, the copies of it started for the next graph are not valid
+        ggml_backend_sched_drop_prefetch_next(sched.get());
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
@@ -3899,6 +3962,11 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
+    // the state overwrites the KV cache, the copies of it started for the next graph are not valid
+    if (sched) {
+        ggml_backend_sched_drop_prefetch_next(sched.get());
+    }
+
     // read model info
     {
         LLAMA_LOG_DEBUG("%s: - reading model info\n", __func__);
@@ -3931,6 +3999,10 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (sched) {
+        ggml_backend_sched_drop_prefetch_next(sched.get());
+    }
+
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4281,6 +4353,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_offload_swa_only         =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -761,6 +762,136 @@ struct case_noalloc : ctx_test {
     }
 };
 
+// kv_offload_swa_only
+//
+
+// bytes of the context memory in host buffers and in all buffers
+static std::pair<size_t, size_t> ctx_mem_host_total(const llama_context * ctx) {
+    size_t host  = 0;
+    size_t total = 0;
+    for (const auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
+        if (ggml_backend_buft_is_host(buft)) {
+            host += data.context;
+        }
+        total += data.context;
+    }
+    return { host, total };
+}
+
+// these archs use an iSWA cache with both SWA and non-SWA layers
+static bool arch_has_iswa_base(const llama_model * model) {
+    char arch_str[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch_str, sizeof(arch_str));
+
+    for (const char * arch : { "gemma2", "gemma3", "cohere2", "muse-glimmer" }) {
+        if (strcmp(arch_str, arch) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// - create a context with kv_offload_swa_only, decode the prompt and compare against the baseline logits
+// - SWA models: the non-SWA KV moves to host memory when the KV is offloaded, the total stays the same
+// - other models, or no KV offload: the flag is ignored and the placement does not change
+// decode the prompt with the split of the baseline: all but the last token, then the last token
+static bool decode_prompt_split(llama_context * ctx, const model_run & mr, int & n_past) {
+    const llama_tokens prefix(mr.tokens.begin(), mr.tokens.end() - 1);
+
+    n_past = 0;
+    if (!common_prompt_batch_decode(ctx, prefix, (int) prefix.size(), n_past, mr.params.n_batch, "", false)) {
+        return false;
+    }
+    if (!common_replay_last_token(ctx, mr.tokens.back(), n_past)) {
+        return false;
+    }
+    n_past++;
+
+    return true;
+}
+
+struct case_kv_offload_swa_only : ctx_test {
+    // n_ubatch: 0 = from params, compared against the baseline, otherwise compared against a run with the same n_ubatch
+    case_kv_offload_swa_only(bool kv_offload_, uint32_t n_ubatch_) : kv_offload(kv_offload_), n_ubatch(n_ubatch_) {}
+
+    const char * name() const override { return n_ubatch ? "kvo_swa_ub" : kv_offload ? "kvo_swa" : "nkvo_swa"; }
+
+    const char * description() const override {
+        if (n_ubatch) {
+            return "kv_offload_swa_only over several ubatches gives the logits of the same run without it";
+        }
+        return kv_offload
+            ? "kv_offload_swa_only keeps the non-SWA KV in host memory and gives the baseline logits"
+            : "kv_offload_swa_only without KV offload is ignored and gives the baseline logits";
+    }
+
+    bool needs_baseline() const override { return n_ubatch == 0; }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_seq_max  = 2;
+        opts.n_ubatch   = n_ubatch;
+        opts.kv_offload = kv_offload ? 1 : 0;
+
+        auto ctx_ref = mr.ctx(opts);
+        CTX_REQUIRE(ctx_ref, "failed to create the reference context");
+
+        // a non-causal batch is processed in a single ubatch
+        if (n_ubatch && (llama_model_has_encoder(mr.model) || !llama_get_causal_attn(ctx_ref.get()))) {
+            return case_result::skip("the batch cannot be split into ubatches");
+        }
+
+        opts.kv_offload_swa_only = true;
+
+        auto ctx  = mr.ctx(opts);
+        auto smpl = mr.sampler();
+        CTX_REQUIRE(ctx, "failed to create the context with kv_offload_swa_only");
+
+        const auto [host_ref, total_ref] = ctx_mem_host_total(ctx_ref.get());
+        const auto [host,     total]     = ctx_mem_host_total(ctx.get());
+
+        TLOG_INF("%s: host %zu -> %zu, total %zu -> %zu bytes\n", __func__, host_ref, host, total_ref, total);
+
+        // the flag is ignored for memory types other than iSWA, and an iSWA cache may have no non-SWA layers
+        // the moved KV can have a staging buffer on the device, with the size of the KV of one layer
+        const bool has_device_kv = host_ref < total_ref;
+        if (kv_offload && llama_model_n_swa(mr.model) > 0 && has_device_kv) {
+            CTX_REQUIRE(host >= host_ref, "KV was moved from host memory to the device");
+            CTX_REQUIRE(host < total, "the SWA KV was moved to host memory");
+            CTX_REQUIRE(total - host <= total_ref - host_ref, "the device memory of the KV increased");
+            CTX_REQUIRE(total >= total_ref, "the total memory of the KV decreased");
+            CTX_REQUIRE(host > host_ref || !arch_has_iswa_base(mr.model), "no KV was moved to host memory");
+        } else {
+            CTX_REQUIRE(host == host_ref && total == total_ref, "the KV placement changed although the flag must be ignored");
+        }
+
+        if (n_ubatch && host == host_ref) {
+            return case_result::skip("no KV is moved to host memory");
+        }
+
+        generation_result expected;
+        if (n_ubatch) {
+            auto smpl_ref = mr.sampler();
+            int n_past_ref = 0;
+            CTX_REQUIRE(decode_prompt_split(ctx_ref.get(), mr, n_past_ref), "failed to decode the prompt in the reference context");
+            CTX_REQUIRE(generate_tokens(ctx_ref.get(), smpl_ref.get(), n_past_ref, mr.params.n_predict, 0, expected), "failed to generate in the reference context");
+            CTX_REQUIRE(!expected.empty(), "the reference context generated nothing");
+        }
+        ctx_ref.reset();
+
+        int n_past = 0;
+        CTX_REQUIRE(decode_prompt_split(ctx.get(), mr, n_past), "failed to decode the prompt");
+
+        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 0, n_ubatch ? expected : mr.baseline, NMSE_THRESHOLD)) {
+            return case_result::fail();
+        }
+
+        return case_result::pass();
+    }
+
+    bool     kv_offload;
+    uint32_t n_ubatch;
+};
 struct case_comp_padding : ctx_test {
     const char * name() const override { return "comp_padding"; }
 
@@ -836,6 +967,9 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
     cases.push_back(std::make_unique<case_noalloc>());
     cases.push_back(std::make_unique<case_comp_padding>());
+    cases.push_back(std::make_unique<case_kv_offload_swa_only>(true, 0));
+    cases.push_back(std::make_unique<case_kv_offload_swa_only>(false, 0));
+    cases.push_back(std::make_unique<case_kv_offload_swa_only>(true, 16));
 
     return cases;
 }

@@ -1270,7 +1270,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, no_alloc, hparams_raw, type_k, type_v,
-            v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch,
+            v_trans, offload, false, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch,
             nullptr, filter_raw, reuse, nullptr);
 
     // V4.1: CSA slot = ratio 2, HCA slot = ratio 1, no overlap and no indexer compressor; the index K is stored

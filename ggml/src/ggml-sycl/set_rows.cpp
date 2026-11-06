@@ -554,6 +554,16 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
 
 void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+
+    // the destination can be in host memory, the kernel then writes to it directly
+    // it must be USM host memory of the context of the device, any other memory faults the GPU
+    {
+        const sycl::usm::alloc type = sycl::get_pointer_type(dst->data, ctx.stream()->get_context());
+        if (type != sycl::usm::alloc::device) {
+            GGML_ASSERT(type == sycl::usm::alloc::host && "SET_ROWS to memory that is not accessible by the device");
+            GGML_ASSERT(ggml_blck_size(dst->type) != QK_K && "SET_ROWS to host memory is not supported for the types quantized on the host");
+        }
+    }
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 

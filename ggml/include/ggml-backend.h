@@ -161,6 +161,8 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // async copies into the device run after the work already queued on it
+        bool async_copy_in_order;
     };
 
     // all the device properties
@@ -369,6 +371,20 @@ extern "C" {
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+
+    // A second backend on the device of backend, with its own queue, used for the prefetch copies to the device
+    GGML_API void                 ggml_backend_sched_set_copy_backend(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_t copy_backend);
+
+    // Copy src (in host memory) to dst (in device memory) after the node after is computed (NULL = at the start of the graph),
+    // the copy completes before the node before is computed. Without a copy backend or events, the copy is done just before the node before
+    // src and dst must be contiguous views with the same size, they do not need to be in the graph
+    // The prefetches are cleared by ggml_backend_sched_reset
+    // before = NULL: the copy is for the next graph computed, it is only done with a copy backend and it is not waited for in this graph
+    // a prefetch of the next graph without a node after, with the same src and dst data and size, then uses it instead of copying again
+    GGML_API void                 ggml_backend_sched_add_prefetch(ggml_backend_sched_t sched, struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_tensor * after, struct ggml_tensor * before);
+
+    // Wait for the copies started for the next graph and drop them, must be called before the src of a prefetch is modified outside of a graph
+    GGML_API void                 ggml_backend_sched_drop_prefetch_next(ggml_backend_sched_t sched);
 
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);

@@ -584,6 +584,7 @@ static void ggml_backend_zdnn_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr = */ false,
         /* .events               = */ false,
         /* .mmap_support         = */ true,
+        /* .async_copy_in_order  = */ false,
     };
 }
 

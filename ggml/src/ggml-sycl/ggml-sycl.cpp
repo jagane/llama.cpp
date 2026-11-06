@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <unistd.h>
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
@@ -864,6 +865,33 @@ static bool ggml_sycl_buffer_init_staging(ggml_backend_sycl_buffer_context * ctx
     return ctx->staging.data != nullptr;
 }
 
+// a small copy between pinned host memory and the device, done by a kernel on the compute queue
+// a memcpy uses the copy engine, where it waits behind the copies of the copy queue (the KV prefetches)
+// the large copies, e.g. the 8 MiB chunks of the model upload, still use the copy engine
+static constexpr size_t GGML_SYCL_KERNEL_COPY_MAX = 4u*1024*1024;
+
+static bool ggml_sycl_kernel_copy(const queue_ptr & stream, void * dst, const void * src, size_t size, const void * host_ptr, sycl::event * ev = nullptr) {
+    if (size > GGML_SYCL_KERNEL_COPY_MAX || sycl::get_pointer_type(host_ptr, stream->get_context()) != sycl::usm::alloc::host) {
+        return false;
+    }
+    if ((uintptr_t) dst % 4 == 0 && (uintptr_t) src % 4 == 0 && size % 4 == 0) {
+        uint32_t * d = (uint32_t *) dst;
+        const uint32_t * s = (const uint32_t *) src;
+        sycl::event e = stream->parallel_for(sycl::range<1>(size / 4), [=](sycl::id<1> i) { d[i] = s[i]; });
+        if (ev) {
+            *ev = e;
+        }
+    } else {
+        uint8_t * d = (uint8_t *) dst;
+        const uint8_t * s = (const uint8_t *) src;
+        sycl::event e = stream->parallel_for(sycl::range<1>(size), [=](sycl::id<1> i) { d[i] = s[i]; });
+        if (ev) {
+            *ev = e;
+        }
+    }
+    return true;
+}
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -890,7 +918,9 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
             }
             void * stage = (char *) ctx->staging.data + slot * ctx->staging_slot_size;
             memcpy(stage, src, chunk);
-            ctx->staging.events[slot] = stream->memcpy(dst, stage, chunk);
+            if (!ggml_sycl_kernel_copy(stream, dst, stage, chunk, stage, &ctx->staging.events[slot])) {
+                ctx->staging.events[slot] = stream->memcpy(dst, stage, chunk);
+            }
             ctx->staging.submitted[slot] = true;
             src       += chunk;
             dst       += chunk;
@@ -961,6 +991,24 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// [GGML_SYCL_COPY_TRACE] the blocking host waits are written to <file>.host.<pid>.csv, with the host time of the steady clock
+static FILE * g_sycl_host_trace = nullptr;
+
+static uint64_t ggml_sycl_host_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct ggml_sycl_host_wait_trace {
+    const char * kind;
+    uint64_t     t0;
+    explicit ggml_sycl_host_wait_trace(const char * kind) : kind(kind), t0(g_sycl_host_trace ? ggml_sycl_host_ns() : 0) {}
+    ~ggml_sycl_host_wait_trace() {
+        if (g_sycl_host_trace) {
+            fprintf(g_sycl_host_trace, "%s,%" PRIu64 ",%" PRIu64 "\n", kind, t0, ggml_sycl_host_ns());
+        }
+    }
+};
+
 static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                 const ggml_tensor *tensor,
                                                 void *data, size_t offset,
@@ -973,6 +1021,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
 
+    ggml_sycl_host_wait_trace trace("get_tensor");
     SYCL_CHECK(CHECK_TRY_ERROR(
         stream.memcpy(data, (const char *)tensor->data + offset, size)
             .wait()));
@@ -6518,8 +6567,59 @@ static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
     return sycl_ctx->name.c_str();
 }
 
+// write the completed copies of the trace, all of them with wait_all
+static void ggml_sycl_copy_trace_flush(ggml_backend_sycl_context * sycl_ctx, bool wait_all) {
+    auto & trace = sycl_ctx->copy_trace;
+    size_t n = 0;
+    for (; n < trace.size(); ++n) {
+        auto & e = trace[n];
+        if (wait_all) {
+            e.ev.wait();
+        } else if (e.ev.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {
+            break;
+        }
+        fprintf(sycl_ctx->copy_trace_file, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%zu,%p\n", e.host_ns,
+                (uint64_t) e.ev.get_profiling_info<sycl::info::event_profiling::command_submit>(),
+                (uint64_t) e.ev.get_profiling_info<sycl::info::event_profiling::command_start>(),
+                (uint64_t) e.ev.get_profiling_info<sycl::info::event_profiling::command_end>(),
+                e.size, e.dst);
+    }
+    trace.erase(trace.begin(), trace.begin() + n);
+}
+
+static void ggml_sycl_compute_trace_flush(ggml_backend_sycl_context * sycl_ctx, bool wait_all) {
+    auto & trace = sycl_ctx->compute_trace;
+    size_t n = 0;
+    for (; n < trace.size(); ++n) {
+        auto & e = trace[n].second;
+        if (wait_all) {
+            e.wait();
+        } else if (e.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {
+            break;
+        }
+        fprintf(sycl_ctx->compute_trace_file, "%c,%" PRIu64 ",%" PRIu64 "\n", trace[n].first,
+                (uint64_t) e.get_profiling_info<sycl::info::event_profiling::command_start>(),
+                (uint64_t) e.get_profiling_info<sycl::info::event_profiling::command_end>());
+    }
+    trace.erase(trace.begin(), trace.begin() + n);
+}
+
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+
+    if (sycl_ctx->compute_trace_file) {
+        ggml_sycl_compute_trace_flush(sycl_ctx, true);
+        fclose(sycl_ctx->compute_trace_file);
+    }
+
+    if (sycl_ctx->copy_trace_file) {
+        ggml_sycl_copy_trace_flush(sycl_ctx, true);
+        fclose(sycl_ctx->copy_trace_file);
+        if (g_sycl_host_trace) {
+            fclose(g_sycl_host_trace);
+            g_sycl_host_trace = nullptr;
+        }
+    }
 
     delete sycl_ctx;
     delete backend;
@@ -6537,6 +6637,19 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (sycl_ctx->own_queue) {
+        const uint64_t host_ns = sycl_ctx->copy_trace_file ? ggml_sycl_host_ns() : 0;
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->own_queue_last =
+            (stream)->memcpy((char *)tensor->data + offset, data, size, sycl_ctx->own_queue_deps)));
+        sycl_ctx->own_queue_deps.clear();
+        if (sycl_ctx->copy_trace_file) {
+            sycl_ctx->copy_trace.push_back({ *sycl_ctx->own_queue_last, host_ns, size, tensor->data });
+            if (sycl_ctx->copy_trace.size() >= 256) {
+                ggml_sycl_copy_trace_flush(sycl_ctx, false);
+            }
+        }
+        return;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
 }
@@ -6558,6 +6671,9 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (ggml_sycl_kernel_copy(stream, data, (const char *)tensor->data + offset, size, data)) {
+        return;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
         data, (const char *)tensor->data + offset, size)));
 }
@@ -6567,29 +6683,37 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
+static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src,
+                                               ggml_backend_t backend_dst,
                                                const ggml_tensor *src,
                                                ggml_tensor *dst) try {
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    bool is_cpy_supported                = dst->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
-                            ggml_backend_buffer_is_sycl(src->buffer);
+    GGML_UNUSED(backend_src);
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend_dst->context;
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+
+    // only host -> device from pinned memory usable by this queue, a copy from pageable memory is not async
+    // the pinned memory of another device is fine when the devices share the context
+    const bool is_cpy_supported = g_ggml_sycl_enable_host_pinned_mem &&
+        buf_src->buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name &&
+        buf_dst->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
+        sycl::get_pointer_type(src->data, stream->get_context()) == sycl::usm::alloc::host;
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
     GGML_SYCL_DEBUG(" is_cpy_supported=%d\n", is_cpy_supported);
-    if (is_cpy_supported) {
-        /*
-        DPCT1009:215: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-            dst->data, src->data, ggml_nbytes(dst))));
-        return true;
+    if (!is_cpy_supported) {
+        return false;
     }
 
-    return false;
+    // the queue is in-order, so the copy runs after the work already queued on this device
+    if (ggml_sycl_kernel_copy(stream, dst->data, src->data, ggml_nbytes(src), src->data)) {
+        return true;
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(dst->data, src->data, ggml_nbytes(src))));
+    return true;
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -6601,7 +6725,14 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    ggml_sycl_host_wait_trace trace(sycl_ctx->own_queue ? "sync_copy_queue" : "sync");
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+
+    // the pending waits of a copy queue are satisfied once their events complete
+    for (auto & ev : sycl_ctx->own_queue_deps) {
+        SYCL_CHECK(CHECK_TRY_ERROR(ev.wait()));
+    }
+    sycl_ctx->own_queue_deps.clear();
 
     GGML_UNUSED(backend);
 }
@@ -6705,9 +6836,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 #ifndef NDEBUG
-        assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+        // SET_ROWS can write to the pinned host memory, which the device accesses directly, its src[2] is the destination
+        const bool set_rows_host = node->op == GGML_OP_SET_ROWS &&
+            node->buffer->buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name;
+        assert(set_rows_host || node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
         for (int j = 0; j < GGML_MAX_SRC; j++) {
-            if (node->src[j] != nullptr) {
+            if (node->src[j] != nullptr && !(set_rows_host && j == 2)) {
                 assert(node->src[j]->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
             }
         }
@@ -6973,6 +7107,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    ggml_sycl_host_wait_trace trace("enqueue");
 
     // set the device on every call: a graph replay does not go through
     // ggml_backend_sycl_graph_compute_impl()
@@ -7087,8 +7222,17 @@ try
     sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
 
     const queue_ptr &stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (sycl_ctx->own_queue && sycl_ctx->own_queue_deps.empty() && sycl_ctx->own_queue_last) {
+        // the queue is in-order, the last copy completes after the previous work
+        *sycl_event = *sycl_ctx->own_queue_last;
+        return;
+    }
     // Record the current state of the queue
-    SYCL_CHECK(CHECK_TRY_ERROR(*sycl_event = stream->ext_oneapi_submit_barrier()));
+    SYCL_CHECK(CHECK_TRY_ERROR(*sycl_event = stream->ext_oneapi_submit_barrier(sycl_ctx->own_queue_deps)));
+    sycl_ctx->own_queue_deps.clear();
+    if (sycl_ctx->compute_trace_file) {
+        sycl_ctx->compute_trace.emplace_back('r', *sycl_event);
+    }
 }
 catch (sycl::exception const &exc)
 {
@@ -7102,7 +7246,21 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
     sycl::event* sycl_event = static_cast<sycl::event*>(event->context);
 
     if (ggml_backend_is_sycl(backend)) {
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
+        // the queue waits for the event, the host does not block
+        ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+        if (sycl_ctx->own_queue) {
+            sycl_ctx->own_queue_deps.push_back(*sycl_event);
+            return;
+        }
+        const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+        sycl::event ev_barrier;
+        SYCL_CHECK(CHECK_TRY_ERROR(ev_barrier = stream->ext_oneapi_submit_barrier({ *sycl_event })));
+        if (sycl_ctx->compute_trace_file) {
+            sycl_ctx->compute_trace.emplace_back('w', ev_barrier);
+            if (sycl_ctx->compute_trace.size() >= 512) {
+                ggml_sycl_compute_trace_flush(sycl_ctx, false);
+            }
+        }
     } else
         GGML_ABORT("fatal error");
 } catch (sycl::exception const& exc) {
@@ -7118,9 +7276,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL, // ggml_backend_sycl_cpy_tensor_async,
-                                           // // TODO: update for the new
-                                           // interface
+    /* .cpy_tensor_async        = */ ggml_backend_sycl_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_sycl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -7196,13 +7352,63 @@ static void ggml_backend_sycl_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
         /* .mmap_support          = */ true,
+        /* .async_copy_in_order   = */ true,
     };
 }
 
-static ggml_backend_t ggml_backend_sycl_device_init(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(params);
+static ggml_backend_t ggml_backend_sycl_device_init(ggml_backend_dev_t dev, const char * params) try {
     ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *)dev->context;
-    return ggml_backend_sycl_init(ctx->device);
+    ggml_backend_t backend = ggml_backend_sycl_init(ctx->device);
+
+    // "copy_queue": the backend gets its own in-order queue, so that its copies can run concurrently with the compute
+    // it must only be used for copies and events, the buffers are managed with the default queue
+    const char * trace_prefix = getenv("GGML_SYCL_COPY_TRACE");
+    if (backend != nullptr && (params == nullptr || strcmp(params, "copy_queue") != 0) && trace_prefix != nullptr && trace_prefix[0] != '\0') {
+        ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+        const std::string path = std::string(trace_prefix) + ".compute." + std::to_string(ctx->device) + "." + std::to_string(getpid()) + ".csv";
+        sycl_ctx->compute_trace_file = fopen(path.c_str(), "w");
+        if (sycl_ctx->compute_trace_file) {
+            fprintf(sycl_ctx->compute_trace_file, "kind,start_ns,end_ns\n");
+            sycl::queue & q_default = dpct::get_device(ctx->device).default_queue();
+            sycl_ctx->trace_queue = std::make_unique<sycl::queue>(q_default.get_context(), q_default.get_device(),
+                sycl::property_list{ sycl::property::queue::in_order(), sycl::property::queue::enable_profiling() });
+            sycl_ctx->qptrs[ctx->device][0] = sycl_ctx->trace_queue.get();
+        }
+    }
+
+    if (backend != nullptr && params != nullptr && strcmp(params, "copy_queue") == 0) {
+        ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+        sycl::queue & q_default = dpct::get_device(ctx->device).default_queue();
+        const char * trace_path = getenv("GGML_SYCL_COPY_TRACE");
+        if (trace_path != nullptr && trace_path[0] != '\0') {
+            const std::string path = std::string(trace_path) + "." + std::to_string(ctx->device) + "." + std::to_string(getpid()) + ".csv";
+            sycl_ctx->copy_trace_file = fopen(path.c_str(), "w");
+            if (sycl_ctx->copy_trace_file) {
+                fprintf(sycl_ctx->copy_trace_file, "host_ns,submit_ns,start_ns,end_ns,size,dst\n");
+                if (g_sycl_host_trace == nullptr) {
+                    g_sycl_host_trace = fopen((std::string(trace_path) + ".host." + std::to_string(getpid()) + ".csv").c_str(), "w");
+                    if (g_sycl_host_trace) {
+                        fprintf(g_sycl_host_trace, "kind,t0_ns,t1_ns\n");
+                    }
+                }
+                GGML_LOG_WARN("%s: GGML_SYCL_COPY_TRACE is set, the copies of the copy queue are profiled to %s\n", __func__, path.c_str());
+            } else {
+                GGML_LOG_ERROR("%s: failed to open %s\n", __func__, path.c_str());
+            }
+        }
+        const sycl::property_list props = sycl_ctx->copy_trace_file ?
+            sycl::property_list{ sycl::property::queue::in_order(), sycl::property::queue::enable_profiling() } :
+            sycl::property_list{ sycl::property::queue::in_order() };
+        sycl_ctx->own_queue = std::make_unique<sycl::queue>(q_default.get_context(), q_default.get_device(), props);
+        sycl_ctx->qptrs[ctx->device][0] = sycl_ctx->own_queue.get();
+    }
+
+    return backend;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_sycl_device_get_buffer_type(ggml_backend_dev_t dev) {
@@ -7380,6 +7586,12 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 auto res = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
                             op->src[0]->type == GGML_TYPE_BF16) &&
                            (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+                // the destination can be in pinned host memory, but not for the types that are quantized on the host
+                const ggml_backend_buffer_t buf = op->view_src ? op->view_src->buffer : op->buffer;
+                if (res && buf != nullptr && !ggml_backend_buffer_is_sycl(buf)) {
+                    res = buf->buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name &&
+                          g_ggml_sycl_enable_host_pinned_mem && ggml_blck_size(op->type) != QK_K;
+                }
                 return res;
             }
         case GGML_OP_DSV4_HC_PRE:
@@ -7738,6 +7950,7 @@ static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, g
   GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
 
   sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
+  ggml_sycl_host_wait_trace trace("event_sync");
   SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
 } catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__

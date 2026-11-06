@@ -116,7 +116,9 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // lightning indexer keys are rotated with the indexer RoPE parameters
-                       bool   is_indexer = false);
+                       bool   is_indexer = false,
+        // without offload, use the pinned host memory of the layer device, so the copies to the device can be async
+                       bool   host_pinned = false);
 
     ~llama_kv_cache() = default;
 
@@ -204,12 +206,21 @@ public:
     uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // stage: use the device staging buffer of a host layer instead of the cache
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool stage = false) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool stage = false) const;
+
+    bool is_staged(int32_t il) const;
+
+    // for the last layer that uses a staging buffer: the first layer that uses it, -1 otherwise
+    int32_t get_stage_first(int32_t il) const;
+
+    // contiguous (cache, staging) views of the used cells of each stream, to copy the cache to the staging buffer
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> get_stage_copies(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool is_v) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, bool stage = false) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, bool stage = false) const;
 
     //
     // preparation API
@@ -275,6 +286,10 @@ private:
 
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
+
+        // host layers: device buffers shared by the layers of a device, the KV is copied there before the attention
+        ggml_tensor * k_stage = nullptr;
+        ggml_tensor * v_stage = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -417,8 +432,15 @@ public:
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    // stage: use the device staging buffer of a host layer, it is filled with ggml_backend_sched_add_prefetch
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, bool stage = false) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, bool stage = false) const;
+
+    bool is_staged(int32_t il) const;
+
+    int32_t get_stage_first(int32_t il) const;
+
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> get_stage_copies(ggml_context * ctx, int32_t il, bool is_v) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -426,8 +448,8 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, bool stage = false) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, bool stage = false) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

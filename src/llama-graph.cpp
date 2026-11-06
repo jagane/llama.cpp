@@ -3139,7 +3139,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 
-        if (!cparams.offload_kqv) {
+        if (!cparams.offload_kqv || (cparams.kv_offload_swa_only && !hparams.is_swa(il))) {
             // all nodes between the KV store and the attention output are run on the CPU
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
@@ -3606,28 +3606,100 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
 
-    // optionally store to KV cache
-    if (store_kv && k_cur) {
-        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+    // the KV of a host layer is copied to a staging buffer on the device, and the new KV is written to both
+    // a layer that reuses the KV of another layer reads the host cache
+    const bool stage = !use_kv_cur && store_kv && k_cur && v_cur && cparams.flash_attn && mctx_cur->is_staged(il);
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    ggml_tensor * k_stage_set = nullptr;
+    ggml_tensor * v_stage_set = nullptr;
+
+    const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+    const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
+
+    // the backend of the device of the staging buffer
+    // it also writes the new KV to the host cache, in pinned memory, so that the host does not wait for the GPU in the middle of the graph:
+    // a read of the GPU by the host waits behind the copies of the copy queue, which then idles until the host starts the next copy
+    // the host cache must be in the pinned memory of the same device, and the backend must support the write (checked below)
+    ggml_backend_t backend_stage = nullptr;
+    if (stage) {
+        ggml_tensor * k_stage = mctx_cur->get_k(ctx0, il, true);
+        ggml_tensor * k_host  = mctx_cur->get_k(ctx0, il);
+        ggml_backend_buffer_t buf      = k_stage->view_src ? k_stage->view_src->buffer : k_stage->buffer;
+        ggml_backend_buffer_t buf_host = k_host->view_src  ? k_host->view_src->buffer  : k_host->buffer;
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        const bool host_ok = buf_host != nullptr &&
+            ggml_backend_buffer_get_type(buf_host) == ggml_backend_dev_host_buffer_type(dev);
+        for (int i = 0; host_ok && i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(backend) == dev) {
+                backend_stage = backend;
+                break;
+            }
+        }
+    }
+
+    // optionally store to KV cache
+    // the writes to the host cache are added before the writes to the staging buffer
+    if (store_kv && k_cur) {
+        ggml_tensor * k_set = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        if (backend_stage && ggml_backend_supports_op(backend_stage, k_set)) {
+            ggml_backend_sched_set_tensor_backend(sched, k_set, backend_stage);
+        }
+        ggml_build_forward_expand(gf, k_set);
     }
 
     if (store_kv && v_cur) {
-        const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
+        ggml_tensor * v_set = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        if (backend_stage && ggml_backend_supports_op(backend_stage, v_set)) {
+            ggml_backend_sched_set_tensor_backend(sched, v_set, backend_stage);
+        }
+        ggml_build_forward_expand(gf, v_set);
+    }
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    if (stage) {
+        k_stage_set = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, true);
+        v_stage_set = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il, true);
+
+        ggml_build_forward_expand(gf, k_stage_set);
+        ggml_build_forward_expand(gf, v_stage_set);
     }
 
     const auto & kq_mask = is_swa ? inp->self_attn_mask_swa.raw : inp->self_attn_mask.raw;
     const auto & kv_rows = is_swa ? inp->self_attn_mask_swa.rows : inp->self_attn_mask.rows;
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il, stage);
+    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il, stage);
+
+    if (stage) {
+        // the copy starts when the previous attention on the buffer is done, and ends before the new KV is written to the buffer
+        ggml_tensor * after = kv_stage_last[k->view_src];
+        for (const auto & [src, dst] : mctx_cur->get_stage_copies(ctx0, il, false)) {
+            ggml_backend_sched_add_prefetch(sched, src, dst, after, k_stage_set);
+        }
+        for (const auto & [src, dst] : mctx_cur->get_stage_copies(ctx0, il, true)) {
+            ggml_backend_sched_add_prefetch(sched, src, dst, after, v_stage_set);
+        }
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    if (stage) {
+        kv_stage_last[k->view_src] = cur;
+
+        // after the last attention on the buffer, the copy for the first layer that uses it in the next graph can start
+        // it overlaps the end of this graph, the next graph uses it if the cells are the same
+        const int32_t il_first = mctx_cur->get_stage_first(il);
+        if (il_first >= 0) {
+            for (const auto & [src, dst] : mctx_cur->get_stage_copies(ctx0, il_first, false)) {
+                ggml_backend_sched_add_prefetch(sched, src, dst, cur, nullptr);
+            }
+            for (const auto & [src, dst] : mctx_cur->get_stage_copies(ctx0, il_first, true)) {
+                ggml_backend_sched_add_prefetch(sched, src, dst, cur, nullptr);
+            }
+        }
+    }
 
     if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
